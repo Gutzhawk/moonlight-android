@@ -139,6 +139,10 @@ public class VirtualController {
         buttonConfigure.setVisibility(View.VISIBLE);
     }
 
+    public boolean isVisible() {
+        return buttonConfigure.getVisibility() == View.VISIBLE;
+    }
+
     public int switchShowHide() {
         if (buttonConfigure.getVisibility() == View.VISIBLE) {
             hide();

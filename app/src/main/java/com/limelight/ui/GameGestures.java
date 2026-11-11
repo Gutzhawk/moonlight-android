@@ -6,4 +6,6 @@ public interface GameGestures {
     void toggleKeyboard();
 
     default void showGameMenu(GameInputDevice device){};
+
+    default void handleMenuControllerInput(int buttons) {};
 }

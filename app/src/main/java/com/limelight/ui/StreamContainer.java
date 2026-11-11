@@ -86,6 +86,7 @@ public class StreamContainer extends FrameLayout implements SurfaceHolder.Callba
         if (renderMode != StreamMode.MODE_2D) {
             GLSurfaceView glSurfaceView = new GLSurfaceView(context);
             glSurfaceView.setEGLContextClientVersion(3);
+            glSurfaceView.setPreserveEGLContextOnPause(true);
             mStereoRenderer = new Stereo3DRenderer(glSurfaceView, this, context, prefConfig);
             glSurfaceView.setRenderer(mStereoRenderer);
             glSurfaceView.setRenderMode(GLSurfaceView.RENDERMODE_WHEN_DIRTY);
@@ -241,20 +242,20 @@ public class StreamContainer extends FrameLayout implements SurfaceHolder.Callba
         if (renderMode == StreamMode.MODE_2D && width > 0 && height > 0) {
             mCurrentSurface = holder.getSurface();
             notifySurfaceReady();
+        } else if (mStereoRenderer != null && mStereoRenderer.getVideoSurface() != null) {
+            mCurrentSurface = mStereoRenderer.getVideoSurface();
+            notifySurfaceReady();
         }
 
         game.surfaceChanged(holder, format, width, height);
     }
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
-        if (renderMode == StreamMode.MODE_2D) {
-            isSurfaceReady = false;
-            mCurrentSurface = null;
-        } else if (mStereoRenderer != null) {
-            mStereoRenderer.onSurfaceDestroyed();
-        }
-
+        // Detach the decoder before releasing any render targets. The 3D renderer's
+        // resources belong to the session, not to the visibility of its window.
         game.surfaceDestroyed(holder);
+        isSurfaceReady = false;
+        mCurrentSurface = null;
     }
 
     @Override
