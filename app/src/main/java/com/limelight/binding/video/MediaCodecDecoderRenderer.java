@@ -133,6 +133,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private boolean invertResolution;
     private int videoFormat;
     private Surface renderTarget;
+    private boolean decoderStarted;
+    private volatile boolean backgroundOutput;
     private volatile boolean stopping;
     private CrashListener crashListener;
     private boolean reportedCrash;
@@ -359,7 +361,36 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     }
 
     public void setRenderTarget(Surface renderTarget) {
-        this.renderTarget = renderTarget;
+        synchronized (codecRecoveryMonitor) {
+            this.renderTarget = renderTarget;
+        }
+    }
+
+    /** Switch only the decoder output; keep the network stream and codec state alive. */
+    public boolean replaceRenderTarget(Surface target) {
+        return replaceRenderTarget(target, false);
+    }
+
+    public boolean replaceRenderTarget(Surface target, boolean background) {
+        synchronized (codecRecoveryMonitor) {
+            if (stopping || target == null || !target.isValid()) return false;
+            if (target == renderTarget) {
+                backgroundOutput = background;
+                return true;
+            }
+            if (decoderStarted) {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return false;
+                try {
+                    videoDecoder.setOutputSurface(target);
+                } catch (RuntimeException e) {
+                    LimeLog.warning("Decoder surface switch failed: " + e);
+                    return false;
+                }
+            }
+            renderTarget = target;
+            backgroundOutput = background;
+            return true;
+        }
     }
 
     public MediaCodecDecoderRenderer(Activity activity, PreferenceConfiguration prefs,
@@ -575,6 +606,14 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     }
 
     private void configureAndStartDecoder(MediaFormat format) {
+        synchronized (codecRecoveryMonitor) {
+            decoderStarted = false;
+            configureAndStartDecoderLocked(format);
+            decoderStarted = true;
+        }
+    }
+
+    private void configureAndStartDecoderLocked(MediaFormat format) {
         // Set HDR metadata if present
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             if (currentHdrMetadata != null) {
@@ -1209,6 +1248,26 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 BufferInfo info = new BufferInfo();
                 long lastOutputNs = System.nanoTime();
                 while (!stopping) {
+                    // Hidden streams do not need display VSYNC. Keep consuming decoder
+                    // output even when the screen is off and Choreographer stops ticking.
+                    if (backgroundOutput) {
+                        try {
+                            Integer queued;
+                            while ((queued = outputBufferQueue.poll()) != null) {
+                                videoDecoder.releaseOutputBuffer(queued, false);
+                            }
+                            int output = videoDecoder.dequeueOutputBuffer(info, 10000);
+                            if (output >= 0) videoDecoder.releaseOutputBuffer(output, false);
+                        } catch (IllegalStateException e) {
+                            if (!stopping) handleDecoderException(e);
+                        }
+                        if (codecRecoveryType.get() != CR_RECOVERY_TYPE_NONE && choreographerHandler != null) {
+                            // A hidden display may no longer deliver VSYNC callbacks.
+                            choreographerHandler.post(() -> doCodecRecoveryIfRequired(CR_FLAG_CHOREOGRAPHER));
+                        }
+                        doCodecRecoveryIfRequired(CR_FLAG_RENDER_THREAD);
+                        continue;
+                    }
                     /* LATEST_ONLY_LOW_LATENCY */
                     if (!preferLowerDelays) {
                         try {
@@ -1643,7 +1702,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
     @Override
     public void cleanup() {
-        videoDecoder.release();
+        synchronized (codecRecoveryMonitor) {
+            decoderStarted = false;
+            videoDecoder.release();
+        }
     }
 
     @Override

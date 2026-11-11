@@ -25,6 +25,7 @@ import com.limelight.binding.input.virtual_controller.VirtualController;
 import com.limelight.binding.input.virtual_controller.keyboard.KeyBoardController;
 import com.limelight.binding.input.virtual_controller.keyboard.KeyBoardLayoutController;
 import com.limelight.binding.video.CrashListener;
+import com.limelight.binding.video.BackgroundSurface;
 import com.limelight.binding.video.MediaCodecDecoderRenderer;
 import com.limelight.binding.video.MediaCodecHelper;
 import com.limelight.binding.video.PerfOverlayListener;
@@ -191,6 +192,10 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     private boolean autoEnterPip = false;
     private boolean surfaceCreated = false;
     private boolean attemptedConnection = false;
+    private BackgroundSurface backgroundSurface;
+    private boolean activityVisible;
+    private boolean menuInputSuppressed;
+    private boolean restoreVirtualController;
     private int suppressPipRefCount = 0;
     private String pcName;
     private String appName;
@@ -290,6 +295,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         void showMenu(GameInputDevice devic);
         void hideMenu();
         boolean isMenuOpen();
+        void handleControllerInput(int buttons);
     }
 
     public GameMenuCallbacks gameMenuCallbacks;
@@ -346,6 +352,12 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         timerHandler = new Handler(Looper.getMainLooper());
 
         UiHelper.setLocale(this);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            androidx.core.app.ActivityCompat.requestPermissions(this,
+                    new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 2003);
+        }
 
         // We don't want a title bar
         requestWindowFeature(Window.FEATURE_NO_TITLE);
@@ -868,6 +880,19 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             if (!attemptedConnection) {
                 LimeLog.info("Surface is available, starting connection...");
                 attemptedConnection = true;
+                connecting = true;
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    try {
+                        backgroundSurface = new BackgroundSurface();
+                    } catch (RuntimeException e) {
+                        LimeLog.warning("Background surface unavailable: " + e);
+                    }
+                }
+
+                Intent service = new Intent(this, StreamSessionService.class);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(service);
+                else startService(service);
 
                 // Der Decoder erhält die jeweils aktive Oberfläche vom Container
                 decoderRenderer.setRenderTarget(streamContainer.getSurface());
@@ -875,6 +900,9 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 // Starten Sie die NvConnection
                 conn.start(new AndroidAudioRenderer(Game.this, prefConfig.playHostAudio),
                         decoderRenderer, Game.this);
+            } else if ((connected || connecting) &&
+                    !decoderRenderer.replaceRenderTarget(streamContainer.getSurface())) {
+                backgroundStreamingFailed();
             }
         });
 
@@ -1700,6 +1728,8 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     @Override
     protected void onDestroy() {
+        stopConnection();
+        hideGameMenu();
         super.onDestroy();
 
         instance = null;
@@ -1758,13 +1788,56 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     }
 
     @Override
+    protected void onStart() {
+        super.onStart();
+        onStreamWindowStarted();
+    }
+
+    void onStreamWindowStarted() {
+        activityVisible = true;
+        if (decoderRenderer != null) decoderRenderer.notifyVideoForeground();
+        if (controllerHandler != null) controllerHandler.setLocalInputSuppressed(menuInputSuppressed);
+        if (virtualController != null && restoreVirtualController) virtualController.show();
+    }
+
+    public void setMenuInputSuppressed(boolean suppressed) {
+        menuInputSuppressed = suppressed;
+        if (controllerHandler != null) {
+            controllerHandler.setLocalInputSuppressed(suppressed || !activityVisible);
+        }
+    }
+
+    public void keepStreamInBackground() {
+        if (backgroundSurface == null) {
+            Toast.makeText(this, R.string.stream_background_unavailable, Toast.LENGTH_LONG).show();
+            return;
+        }
+        moveTaskToBack(true);
+    }
+
+    private void backgroundStreamingFailed() {
+        Toast.makeText(this, R.string.stream_background_unavailable, Toast.LENGTH_LONG).show();
+        finish();
+    }
+
+    @Override
     protected void onStop() {
         super.onStop();
+        onStreamWindowStopped();
+    }
+
+    void onStreamWindowStopped() {
+
+        activityVisible = false;
+        if (controllerHandler != null) controllerHandler.setLocalInputSuppressed(true);
+        if (decoderRenderer != null) decoderRenderer.notifyVideoBackground();
+        hideGameMenu();
 
         SpinnerDialog.closeDialogs(this);
         Dialog.closeDialogs();
 
         if (virtualController != null) {
+            restoreVirtualController = virtualController.isVisible();
             virtualController.hide();
         }
         if (keyBoardController != null) {
@@ -1773,6 +1846,12 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
         if(keyBoardLayoutController!=null){
             keyBoardLayoutController.hide();
+        }
+
+        // Home/app switching hides the window, but does not end the user's stream.
+        // Explicit disconnect/quit still follows the normal shutdown path below.
+        if (!isFinishing() && (connected || connecting) && backgroundSurface != null) {
+            return;
         }
 
         if (conn != null) {
@@ -3452,14 +3531,19 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     }
 
     private void stopConnection() {
+        stopService(new Intent(this, StreamSessionService.class));
         if (connecting || connected) {
             connecting = connected = false;
             updatePipAutoEnter();
 
             controllerHandler.stop();
+            decoderRenderer.prepareForStop();
 
             // Update GameManager state to indicate we're no longer in game
             UiHelper.notifyStreamEnded(this);
+
+            final BackgroundSurface surfaceToRelease = backgroundSurface;
+            backgroundSurface = null;
 
             // Stop may take a few hundred ms to do some network I/O to tell
             // the server we're going away and clean up. Let it run in a separate
@@ -3468,7 +3552,11 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             // during the process of stopping this one.
             new Thread() {
                 public void run() {
-                    conn.stop();
+                    try {
+                        conn.stop();
+                    } finally {
+                        if (surfaceToRelease != null) surfaceToRelease.release();
+                    }
                     if (httpConn != null && quitOnStop) {
                         try {
                             sleep(1000);
@@ -3695,7 +3783,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 timerHandler.postDelayed(new Runnable() {
                     @Override
                     public void run() {
-                        setInputGrabState(true);
+                        if (activityVisible && !isFinishing()) setInputGrabState(true);
                     }
                 }, 500);
 
@@ -3849,11 +3937,20 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             throw new IllegalStateException("Surface destroyed before creation!");
         }
 
+        surfaceCreated = false;
+
         if (attemptedConnection) {
+            // Android destroys SurfaceView buffers when its window becomes invisible.
+            // Move the decoder BEFORE those buffers are released, without touching NvConnection.
+            if (!isFinishing() && backgroundSurface != null && (connecting || connected) &&
+                    decoderRenderer.replaceRenderTarget(backgroundSurface.getSurface(), true)) {
+                return;
+            }
+            if (!isFinishing() && (connecting || connected)) backgroundStreamingFailed();
             // Let the decoder know immediately that the surface is gone
             decoderRenderer.prepareForStop();
 
-            if (connected) {
+            if (connected || connecting) {
                 stopConnection();
             }
         }
@@ -4258,6 +4355,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     @Override
     public void showGameMenu(GameInputDevice device) {
+        if (isFinishing() || !activityVisible) return;
         if(isOnExternalDisplay()) {
             ExternalDisplayControlActivity.toggleGameMenu();
         } else {
@@ -4271,6 +4369,11 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         if (gameMenuCallbacks != null) {
             gameMenuCallbacks.hideMenu();
         }
+    }
+
+    @Override
+    public void handleMenuControllerInput(int buttons) {
+        if (gameMenuCallbacks != null) gameMenuCallbacks.handleControllerInput(buttons);
     }
 
     private void updateFloatingButtonVisibility(boolean show) {

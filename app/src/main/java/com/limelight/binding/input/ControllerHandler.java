@@ -129,6 +129,35 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
     private final Handler backgroundThreadHandler;
     private boolean hasGameController;
     private boolean stopped = false;
+    private volatile boolean localInputSuppressed;
+
+    public void setLocalInputSuppressed(boolean suppressed) {
+        if (localInputSuppressed == suppressed) return;
+        localInputSuppressed = suppressed;
+        for (int i = 0; i < inputDeviceContexts.size(); i++) clearLocalState(inputDeviceContexts.valueAt(i));
+        for (int i = 0; i < usbDeviceContexts.size(); i++) clearLocalState(usbDeviceContexts.valueAt(i));
+        clearLocalState(defaultContext);
+        // Release held inputs on the host before handing control to Android/the menu.
+        if (suppressed) {
+            conn.sendMouseButtonUp(MouseButtonPacket.BUTTON_LEFT);
+            conn.sendMouseButtonUp(MouseButtonPacket.BUTTON_RIGHT);
+            for (short i = 0; i < 16; i++) {
+                if ((getActiveControllerMask() & (1 << i)) != 0) {
+                    conn.sendControllerInput(i, getActiveControllerMask(), 0,
+                            (byte) 0, (byte) 0, (short) 0, (short) 0, (short) 0, (short) 0);
+                }
+            }
+        }
+    }
+
+    private void clearLocalState(GenericControllerContext context) {
+        // Keep stick-button releases trackable by the shortcut, discard stale game inputs.
+        context.inputMap &= ControllerPacket.LS_CLK_FLAG | ControllerPacket.RS_CLK_FLAG;
+        context.leftTrigger = context.rightTrigger = 0;
+        context.leftStickX = context.leftStickY = context.rightStickX = context.rightStickY = 0;
+        context.mouseEmulationLastInputMap = 0;
+        context.mouseEmulationXDown = false;
+    }
 
     private final PreferenceConfiguration prefConfig;
     private short currentControllers, initialControllers;
@@ -1215,6 +1244,19 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
     private void sendControllerInputPacket(GenericControllerContext originalContext) {
         assignControllerNumberIfNeeded(originalContext);
 
+        if (originalContext.menuShortcut.update(originalContext.inputMap)) {
+            setLocalInputSuppressed(true);
+            mainThreadHandler.post(() -> gestures.showGameMenu(originalContext));
+        }
+        if (localInputSuppressed) {
+            // USB drivers do not generate Android key events for dialog navigation.
+            if (originalContext instanceof UsbDeviceContext) {
+                int buttons = originalContext.inputMap;
+                mainThreadHandler.post(() -> gestures.handleMenuControllerInput(buttons));
+            }
+            return;
+        }
+
         // Take the context's controller number and fuse all inputs with the same number
         short controllerNumber = originalContext.controllerNumber;
         int inputMap = 0;
@@ -1233,7 +1275,7 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
             if (context.assignedControllerNumber &&
                     context.controllerNumber == controllerNumber &&
                     context.mouseEmulationActive == originalContext.mouseEmulationActive) {
-                inputMap |= context.inputMap;
+                inputMap |= context.menuShortcut.filter(context.inputMap);
                 leftTrigger |= maxByMagnitude(leftTrigger, context.leftTrigger);
                 rightTrigger |= maxByMagnitude(rightTrigger, context.rightTrigger);
                 leftStickX |= maxByMagnitude(leftStickX, context.leftStickX);
@@ -1247,7 +1289,7 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
             if (context.assignedControllerNumber &&
                     context.controllerNumber == controllerNumber &&
                     context.mouseEmulationActive == originalContext.mouseEmulationActive) {
-                inputMap |= context.inputMap;
+                inputMap |= context.menuShortcut.filter(context.inputMap);
                 leftTrigger |= maxByMagnitude(leftTrigger, context.leftTrigger);
                 rightTrigger |= maxByMagnitude(rightTrigger, context.rightTrigger);
                 leftStickX |= maxByMagnitude(leftStickX, context.leftStickX);
@@ -1257,7 +1299,7 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
             }
         }
         if (defaultContext.controllerNumber == controllerNumber) {
-            inputMap |= defaultContext.inputMap;
+            inputMap |= defaultContext.menuShortcut.filter(defaultContext.inputMap);
             leftTrigger |= maxByMagnitude(leftTrigger, defaultContext.leftTrigger);
             rightTrigger |= maxByMagnitude(rightTrigger, defaultContext.rightTrigger);
             leftStickX |= maxByMagnitude(leftStickX, defaultContext.leftStickX);
@@ -3029,6 +3071,7 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
     }
 
     class GenericControllerContext implements GameInputDevice{
+        final ControllerMenuShortcut menuShortcut = new ControllerMenuShortcut();
         public int id;
         public boolean external;
 
@@ -3062,6 +3105,11 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
             @Override
             public void run() {
                 if (!mouseEmulationActive) {
+                    return;
+                }
+
+                if (localInputSuppressed) {
+                    mainThreadHandler.postDelayed(this, mouseEmulationReportPeriod);
                     return;
                 }
 

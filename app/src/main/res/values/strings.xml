@@ -9,6 +9,12 @@
 
     <string name="menu_button">Menu</string>
     <string name="quick_menu_title">Quick Menu</string>
+    <string name="game_menu_resume">Resume stream</string>
+    <string name="game_menu_background">Keep streaming in background</string>
+    <string name="stream_notification_channel">Active stream</string>
+    <string name="stream_notification_title">Stream is active</string>
+    <string name="stream_notification_text">Tap to return to your stream</string>
+    <string name="stream_background_unavailable">This decoder cannot keep the stream in the background.</string>
     <string name="configuration_mode_move_buttons">Move buttons mode</string>
     <string name="configuration_mode_resize_buttons">Resize buttons mode</string>
     <string name="configuration_mode_disable_enable_buttons">Enable/Disable buttons mode</string>

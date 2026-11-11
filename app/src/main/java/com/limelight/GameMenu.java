@@ -5,17 +5,15 @@ import android.app.AlertDialog;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.os.Handler;
-import android.os.Looper;
 import android.text.TextUtils;
 import android.view.ContextThemeWrapper;
-import android.view.View;
-import android.view.ViewTreeObserver;
-import android.view.Window;
+import android.view.KeyEvent;
 import android.widget.ArrayAdapter;
 import android.widget.Toast;
 
 import com.limelight.binding.input.GameInputDevice;
 import com.limelight.binding.input.KeyboardTranslator;
+import com.limelight.nvstream.input.ControllerPacket;
 import com.limelight.preferences.PreferenceConfiguration;
 import com.limelight.utils.KeyConfigHelper;
 import com.limelight.utils.KeyMapper;
@@ -59,6 +57,7 @@ public class GameMenu implements Game.GameMenuCallbacks {
     private final Context dialogScreenContext;
 
     private AlertDialog currentDialog;
+    private int lastControllerButtons;
 
     public GameMenu(Game game, Context dialogScreenContext) {
         this.game = game;
@@ -113,6 +112,7 @@ public class GameMenu implements Game.GameMenuCallbacks {
         builder.setTitle(title);
 
         final ArrayAdapter<String> actions = new ArrayAdapter<>(themedContext, android.R.layout.simple_list_item_1);
+        for (MenuOption option : options) actions.add(option.label);
 
         builder.setAdapter(actions, (dialog, which) -> {
             String label = actions.getItem(which);
@@ -126,30 +126,37 @@ public class GameMenu implements Game.GameMenuCallbacks {
 
         builder.setOnCancelListener(dialog -> hideMenu());
 
+        builder.setOnKeyListener((dialog, keyCode, event) -> {
+            // Stick releases must reach the shortcut latch even though this dialog has focus.
+            if (keyCode == KeyEvent.KEYCODE_BUTTON_THUMBL || keyCode == KeyEvent.KEYCODE_BUTTON_THUMBR) {
+                if (event.getAction() == KeyEvent.ACTION_UP) game.handleKeyUp(event);
+                return true;
+            }
+            if (keyCode == KeyEvent.KEYCODE_BUTTON_A) {
+                if (event.getAction() == KeyEvent.ACTION_UP) activateSelectedItem();
+                return true;
+            }
+            if (keyCode == KeyEvent.KEYCODE_BUTTON_B) {
+                if (event.getAction() == KeyEvent.ACTION_UP) dialog.cancel();
+                return true;
+            }
+            return false;
+        });
+
         if (currentDialog != null) {
             currentDialog.dismiss();
         }
         currentDialog = builder.show();
+        game.setMenuInputSuppressed(true);
+        currentDialog.setOnDismissListener(dialog -> {
+            if (currentDialog == dialog) {
+                currentDialog = null;
+                game.setMenuInputSuppressed(false);
+            }
+        });
 
-        Window window = currentDialog.getWindow();
-
-        if (window != null) {
-            View decorView = window.getDecorView();
-            decorView.getViewTreeObserver().addOnGlobalLayoutListener(new ViewTreeObserver.OnGlobalLayoutListener() {
-                @Override
-                public void onGlobalLayout() {
-
-                    decorView.getViewTreeObserver().removeOnGlobalLayoutListener(this);
-
-                    new Handler(Looper.getMainLooper()).post(() -> {
-                        for (MenuOption option : options) {
-                            actions.add(option.label);
-                        }
-                        actions.notifyDataSetChanged();
-                    });
-                }
-            });
-        }
+        currentDialog.getListView().setSelection(0);
+        currentDialog.getListView().requestFocus();
     }
 
     private void showSpecialKeysMenu() {
@@ -288,6 +295,9 @@ public class GameMenu implements Game.GameMenuCallbacks {
     public void showMenu(GameInputDevice device) {
         List<MenuOption> options = new ArrayList<>();
 
+        options.add(new MenuOption(getString(R.string.game_menu_resume), null));
+        options.add(new MenuOption(getString(R.string.game_menu_background), game::keepStreamInBackground));
+
         options.add(new MenuOption(getString(R.string.game_menu_disconnect), game::disconnect));
 
         options.add(new MenuOption(getString(R.string.game_menu_quit_session), game::quit));
@@ -339,10 +349,33 @@ public class GameMenu implements Game.GameMenuCallbacks {
             currentDialog.dismiss();
         }
         currentDialog = null;
+        game.setMenuInputSuppressed(false);
     }
 
     @Override
     public boolean isMenuOpen() {
         return currentDialog != null && currentDialog.isShowing();
+    }
+
+    private void activateSelectedItem() {
+        if (!isMenuOpen()) return;
+        android.widget.ListView list = currentDialog.getListView();
+        int position = Math.max(0, list.getSelectedItemPosition());
+        if (position < list.getCount()) {
+            list.performItemClick(list.getSelectedView(), position, list.getItemIdAtPosition(position));
+        }
+    }
+
+    @Override
+    public void handleControllerInput(int buttons) {
+        int pressed = buttons & ~lastControllerButtons;
+        lastControllerButtons = buttons;
+        if (!isMenuOpen()) return;
+        android.widget.ListView list = currentDialog.getListView();
+        int position = Math.max(0, list.getSelectedItemPosition());
+        if ((pressed & ControllerPacket.UP_FLAG) != 0) list.setSelection(Math.max(0, position - 1));
+        if ((pressed & ControllerPacket.DOWN_FLAG) != 0) list.setSelection(Math.min(list.getCount() - 1, position + 1));
+        if ((pressed & ControllerPacket.A_FLAG) != 0) activateSelectedItem();
+        if ((pressed & ControllerPacket.B_FLAG) != 0) hideMenu();
     }
 }
